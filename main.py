@@ -1,14 +1,16 @@
-import os, time, json, requests
+import os, json, time, requests
 from dotenv import load_dotenv
+
 load_dotenv()
 
+# === ENV (tek satır olacak şekilde doldur) ===
 TW_BEARER     = os.getenv("TW_BEARER", "").strip()
 TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "").strip()
-MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000").strip())
+MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000").strip())   # testte 0 yap
 TWEET_LANG    = os.getenv("TWEET_LANG", "tr").strip()
-SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "15").strip())
 
+# === Anahtar kelimeler ===
 KEYWORDS = [
     "kanada lise",
     "yurtdışında üniversite",
@@ -19,11 +21,21 @@ KEYWORDS = [
     "study in Canada"
 ]
 quoted = [f'"{k}"' if " " in k else k for k in KEYWORDS]
-QUERY = "(" + " OR ".join(quoted) + f") lang:{TWEET_LANG} -is:retweet -is:reply"
+RULE_VALUE = "(" + " OR ".join(quoted) + f") lang:{TWEET_LANG} -is:retweet -is:reply"
 
-BASE = "https://api.x.com/2"
+BASE = "https://api.twitter.com/2"   # <- Buraya dikkat (api.twitter.com)
 
-def tg_send(text):
+# === Yardımcılar ===
+def require_env():
+    missing = [k for k, v in {
+        "TW_BEARER": TW_BEARER,
+        "TG_BOT_TOKEN": TG_BOT_TOKEN,
+        "TG_CHAT_ID": TG_CHAT_ID
+    }.items() if not v]
+    if missing:
+        raise SystemExit(f"Missing env vars: {', '.join(missing)}")
+
+def tg_send(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     try:
         requests.post(
@@ -34,88 +46,99 @@ def tg_send(text):
     except Exception as e:
         print("TG error:", e)
 
-def search_once(since_id=None):
-    headers = {"Authorization": f"Bearer {TW_BEARER}"}
+# === Rules yönetimi ===
+def get_headers():
+    return {"Authorization": f"Bearer {TW_BEARER}"}
+
+def clear_rules():
+    r = requests.get(f"{BASE}/tweets/search/stream/rules", headers=get_headers(), timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if "data" in data:
+        ids = [d["id"] for d in data["data"]]
+        if ids:
+            requests.post(f"{BASE}/tweets/search/stream/rules",
+                          headers=get_headers(),
+                          json={"delete": {"ids": ids}},
+                          timeout=15).raise_for_status()
+
+def add_rule():
+    payload = {"add": [{"value": RULE_VALUE, "tag": "edu-watch"}]}
+    r = requests.post(f"{BASE}/tweets/search/stream/rules",
+                      headers=get_headers(), json=payload, timeout=15)
+    if r.status_code == 403:
+        # Plan/izin sorunu veya auth şekli hatalı
+        raise SystemExit(
+            "403 Forbidden (rules): Planın streaming'i desteklemiyor olabilir veya Bearer Token geçersiz.\n"
+            "-> X Developer portalda planını yükselt / doğru projedeki Bearer Token'ı kullan.\n"
+            "-> TW_BEARER tek satır olduğundan emin ol."
+        )
+    r.raise_for_status()
+    print("Rules set:", r.json())
+
+# === Stream ===
+def run_stream():
     params = {
-        "query": QUERY,
-        "max_results": 10,  # daha az sonuç = daha az kota
         "tweet.fields": "created_at,lang,author_id,public_metrics",
         "expansions": "author_id",
         "user.fields": "username,verified,public_metrics,name"
     }
-    if since_id:
-        params["since_id"] = since_id
-    r = requests.get(f"{BASE}/tweets/search/recent", headers=headers, params=params, timeout=15)
-    if r.status_code == 403:
-        raise SystemExit("403 Forbidden: Mevcut dev paketinde 'recent search' kapalı olabilir.")
-    r.raise_for_status()
-    return r.json()
-
-def run_polling():
-    print("Polling started. Query:", QUERY)
-    since_id = None
-    backoff = SLEEP_SECONDS
-
-    # Bootstrap: en yeni ID'yi referans al
-    try:
-        data = search_once()
-        since_id = data.get("meta", {}).get("newest_id", None)
-        print("Bootstrap newest_id:", since_id)
-    except Exception as e:
-        print("Bootstrap error:", e)
-
+    backoff = 1
     while True:
         try:
-            data = search_once(since_id)
-            users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
-            tweets = sorted(data.get("data", []), key=lambda t: t["id"])
-
-            for t in tweets:
-                author = users.get(t["author_id"], {})
-                followers = author.get("public_metrics", {}).get("followers_count", 0)
-                if followers < MIN_FOLLOWERS: 
-                    since_id = t["id"]
-                    continue
-                username = author.get("username", "user")
-                tid = t["id"]
-                link = f"https://twitter.com/{username}/status/{tid}"
-                msg = (
-                    "🚨 Yeni tweet yakalandı\n"
-                    f"👤 @{username} ({followers} takipçi)\n"
-                    f"🧵 {link}\n\n"
-                    "⚠️ Okul hesabından cevap ver.\n"
-                    "✍️ Şablon: OSSD ile Kanada’da lise/üniv. kabulleri hakkında bilgi isterseniz DM yazın. "
-                    "Ontario resmî diploması (OSSD) sunuyoruz."
-                )
-                tg_send(msg)
-                print("Sent:", link)
-                since_id = tid
-
-            # Başarılı tur: backoff'u normale çek
-            time.sleep(SLEEP_SECONDS)
-            backoff = SLEEP_SECONDS
-
+            with requests.get(f"{BASE}/tweets/search/stream",
+                              headers=get_headers(), params=params,
+                              stream=True, timeout=0) as r:
+                if r.status_code == 403:
+                    raise SystemExit(
+                        "403 Forbidden (stream): Planın streaming'e izin vermiyor veya auth hatalı."
+                    )
+                r.raise_for_status()
+                print("Connected to stream. Listening…")
+                backoff = 1
+                for raw in r.iter_lines():
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw.decode("utf-8"))
+                        tweet = obj.get("data", {})
+                        users = {u["id"]: u for u in obj.get("includes", {}).get("users", [])}
+                        author = users.get(tweet.get("author_id"), {})
+                        followers = author.get("public_metrics", {}).get("followers_count", 0)
+                        if followers < MIN_FOLLOWERS:
+                            continue
+                        username = author.get("username", "user")
+                        tid = tweet.get("id")
+                        link = f"https://twitter.com/{username}/status/{tid}"
+                        msg = (
+                            "🚨 Yeni tweet yakalandı\n"
+                            f"👤 @{username} ({followers} takipçi)\n"
+                            f"🧵 {link}\n\n"
+                            "⚠️ Okul hesabından cevap ver.\n"
+                            "✍️ Şablon: OSSD ile Kanada’da lise/üniv. kabulleri için DM atabilirsiniz. "
+                            "Ontario resmî diploması (OSSD) sunuyoruz."
+                        )
+                        tg_send(msg)
+                        print("Sent:", link)
+                    except Exception as e:
+                        print("Parse error:", e)
+        except requests.exceptions.ChunkedEncodingError:
+            # Bağlantı koparsa yeniden bağlan
+            print("Stream dropped. Reconnecting…")
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 429:
-                print("Rate limit (429). Backing off:", backoff, "s")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 300)  # max 5 dk
-            else:
-                print("HTTP error:", e)
-                time.sleep(backoff)
-        except Exception as e:
-            print("Poll error:", e)
+            print("HTTP error:", e)
             time.sleep(backoff)
-
-def require_env():
-    missing = [k for k, v in {
-        "TW_BEARER": TW_BEARER,
-        "TG_BOT_TOKEN": TG_BOT_TOKEN,
-        "TG_CHAT_ID": TG_CHAT_ID
-    }.items() if not v]
-    if missing:
-        raise SystemExit(f"Missing env vars: {', '.join(missing)}")
+            backoff = min(backoff * 2, 60)
+        except Exception as e:
+            print("Stream error:", e)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 if __name__ == "__main__":
     require_env()
-    run_polling()
+    try:
+        clear_rules()
+        add_rule()
+    except requests.exceptions.InvalidHeader:
+        raise SystemExit("TW_BEARER formatı hatalı: tek satır olarak yapıştır.")
+    run_stream()
