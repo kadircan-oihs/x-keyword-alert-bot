@@ -1,13 +1,13 @@
 import os, time, json, requests
 from dotenv import load_dotenv
-
 load_dotenv()
 
 TW_BEARER     = os.getenv("TW_BEARER", "").strip()
 TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "").strip()
-MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000").strip())  # Testte 0 yap
-LANG          = os.getenv("LANG", "tr").strip()
+MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000").strip())
+TWEET_LANG    = os.getenv("TWEET_LANG", "tr").strip()
+SLEEP_SECONDS = int(os.getenv("SLEEP_SECONDS", "15").strip())
 
 KEYWORDS = [
     "kanada lise",
@@ -18,16 +18,13 @@ KEYWORDS = [
     "Canada high school",
     "study in Canada"
 ]
-
 quoted = [f'"{k}"' if " " in k else k for k in KEYWORDS]
-QUERY = "(" + " OR ".join(quoted) + f") lang:{LANG} -is:retweet -is:reply"
+QUERY = "(" + " OR ".join(quoted) + f") lang:{TWEET_LANG} -is:retweet -is:reply"
 
 BASE = "https://api.x.com/2"
 
-def tg_send(text: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("Telegram env eksik; mesaj gönderilmedi.")
-        return
+def tg_send(text):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID: return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
@@ -41,29 +38,29 @@ def search_once(since_id=None):
     headers = {"Authorization": f"Bearer {TW_BEARER}"}
     params = {
         "query": QUERY,
-        "max_results": 50,  # 10-100
+        "max_results": 10,  # daha az sonuç = daha az kota
         "tweet.fields": "created_at,lang,author_id,public_metrics",
         "expansions": "author_id",
         "user.fields": "username,verified,public_metrics,name"
     }
     if since_id:
         params["since_id"] = since_id
-
     r = requests.get(f"{BASE}/tweets/search/recent", headers=headers, params=params, timeout=15)
     if r.status_code == 403:
-        raise SystemExit("403 Forbidden: Geliştirici paketinde 'recent search' kapalı olabilir.")
+        raise SystemExit("403 Forbidden: Mevcut dev paketinde 'recent search' kapalı olabilir.")
     r.raise_for_status()
     return r.json()
 
 def run_polling():
     print("Polling started. Query:", QUERY)
     since_id = None
-    # start bootstrap: altta kalmış en yeniyi referans al ki eski flood düşmesin
+    backoff = SLEEP_SECONDS
+
+    # Bootstrap: en yeni ID'yi referans al
     try:
         data = search_once()
-        if "meta" in data and "newest_id" in data["meta"]:
-            since_id = data["meta"]["newest_id"]
-            print("Bootstrap newest_id:", since_id)
+        since_id = data.get("meta", {}).get("newest_id", None)
+        print("Bootstrap newest_id:", since_id)
     except Exception as e:
         print("Bootstrap error:", e)
 
@@ -71,13 +68,13 @@ def run_polling():
         try:
             data = search_once(since_id)
             users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
-            tweets = data.get("data", [])
-            # En eskiden en yeniye sırala ki Telegram bildirimleri doğru sırada gitsin
-            tweets = sorted(tweets, key=lambda t: t["id"])
+            tweets = sorted(data.get("data", []), key=lambda t: t["id"])
+
             for t in tweets:
                 author = users.get(t["author_id"], {})
                 followers = author.get("public_metrics", {}).get("followers_count", 0)
-                if followers < MIN_FOLLOWERS:
+                if followers < MIN_FOLLOWERS: 
+                    since_id = t["id"]
                     continue
                 username = author.get("username", "user")
                 tid = t["id"]
@@ -87,16 +84,28 @@ def run_polling():
                     f"👤 @{username} ({followers} takipçi)\n"
                     f"🧵 {link}\n\n"
                     "⚠️ Okul hesabından cevap ver.\n"
-                    "✍️ Şablon: OSSD ile Kanada’da lise/üniversite kabulleri hakkında bilgi isterseniz DM yazın. "
+                    "✍️ Şablon: OSSD ile Kanada’da lise/üniv. kabulleri hakkında bilgi isterseniz DM yazın. "
                     "Ontario resmî diploması (OSSD) sunuyoruz."
                 )
                 tg_send(msg)
                 print("Sent:", link)
-                since_id = tid  # en yeni id'yi ilerlet
+                since_id = tid
+
+            # Başarılı tur: backoff'u normale çek
+            time.sleep(SLEEP_SECONDS)
+            backoff = SLEEP_SECONDS
+
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                print("Rate limit (429). Backing off:", backoff, "s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 300)  # max 5 dk
+            else:
+                print("HTTP error:", e)
+                time.sleep(backoff)
         except Exception as e:
             print("Poll error:", e)
-
-        time.sleep(7)  # 5–10 sn arası idealdir (limitine göre ayarla)
+            time.sleep(backoff)
 
 def require_env():
     missing = [k for k, v in {
