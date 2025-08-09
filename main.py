@@ -1,16 +1,14 @@
-import os, json, time, requests
+import os, time, json, requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Env (strip ile gizli boşluk/satır sonlarını temizle) ---
 TW_BEARER     = os.getenv("TW_BEARER", "").strip()
 TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID    = os.getenv("TG_CHAT_ID", "").strip()
-MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000").strip())  # Testte 0 yap, sonra 5000
+MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000").strip())  # Testte 0 yap
 LANG          = os.getenv("LANG", "tr").strip()
 
-# --- Anahtar kelimeler (dilediğin gibi düzenle) ---
 KEYWORDS = [
     "kanada lise",
     "yurtdışında üniversite",
@@ -21,96 +19,69 @@ KEYWORDS = [
     "study in Canada"
 ]
 
-# Filtered Stream kuralı
 quoted = [f'"{k}"' if " " in k else k for k in KEYWORDS]
-RULE_VALUE = "(" + " OR ".join(quoted) + f") lang:{LANG} -is:retweet -is:reply"
+QUERY = "(" + " OR ".join(quoted) + f") lang:{LANG} -is:retweet -is:reply"
 
-# --- Yardımcılar ---
+BASE = "https://api.x.com/2"
+
 def tg_send(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("Telegram env eksik; mesaj gönderilmedi.")
         return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
         requests.post(
-            url,
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
             json={"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True},
             timeout=10
         )
     except Exception as e:
         print("TG error:", e)
 
-def require_env():
-    missing = [k for k, v in {
-        "TW_BEARER": TW_BEARER,
-        "TG_BOT_TOKEN": TG_BOT_TOKEN,
-        "TG_CHAT_ID": TG_CHAT_ID
-    }.items() if not v]
-    if missing:
-        raise SystemExit(f"Missing env vars: {', '.join(missing)}")
-
-# --- X API ---
-BASE = "https://api.x.com/2"
-
-def set_rules():
-    headers = {"Authorization": f"Bearer {TW_BEARER}"}
-    # Mevcut kuralları al
-    r = requests.get(f"{BASE}/tweets/search/stream/rules", headers=headers, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-
-    # Eski kuralları sil
-    if "data" in data:
-        ids = [it["id"] for it in data["data"]]
-        if ids:
-            requests.post(
-                f"{BASE}/tweets/search/stream/rules",
-                headers=headers,
-                json={"delete": {"ids": ids}},
-                timeout=15
-            )
-
-    # Yeni kural ekle
-    payload = {"add": [{"value": RULE_VALUE, "tag": "edu-watch"}]}
-    r = requests.post(
-        f"{BASE}/tweets/search/stream/rules",
-        headers=headers,
-        json=payload,
-        timeout=15
-    )
-    r.raise_for_status()
-    print("Rules set:", r.json())
-
-def stream():
+def search_once(since_id=None):
     headers = {"Authorization": f"Bearer {TW_BEARER}"}
     params = {
-        "tweet.fields": "created_at,lang,author_id,public_metrics,entities",
+        "query": QUERY,
+        "max_results": 50,  # 10-100
+        "tweet.fields": "created_at,lang,author_id,public_metrics",
         "expansions": "author_id",
         "user.fields": "username,verified,public_metrics,name"
     }
-    with requests.get(
-        f"{BASE}/tweets/search/stream",
-        headers=headers, params=params, stream=True, timeout=0
-    ) as r:
-        r.raise_for_status()
-        for raw in r.iter_lines():
-            if not raw:
-                continue
-            try:
-                obj = json.loads(raw.decode("utf-8"))
-                tweet = obj.get("data", {})
-                users = {u["id"]: u for u in obj.get("includes", {}).get("users", [])}
-                author = users.get(tweet.get("author_id"), {})
-                followers = author.get("public_metrics", {}).get("followers_count", 0)
+    if since_id:
+        params["since_id"] = since_id
 
-                # Yüksek takipçi filtresi
+    r = requests.get(f"{BASE}/tweets/search/recent", headers=headers, params=params, timeout=15)
+    if r.status_code == 403:
+        raise SystemExit("403 Forbidden: Geliştirici paketinde 'recent search' kapalı olabilir.")
+    r.raise_for_status()
+    return r.json()
+
+def run_polling():
+    print("Polling started. Query:", QUERY)
+    since_id = None
+    # start bootstrap: altta kalmış en yeniyi referans al ki eski flood düşmesin
+    try:
+        data = search_once()
+        if "meta" in data and "newest_id" in data["meta"]:
+            since_id = data["meta"]["newest_id"]
+            print("Bootstrap newest_id:", since_id)
+    except Exception as e:
+        print("Bootstrap error:", e)
+
+    while True:
+        try:
+            data = search_once(since_id)
+            users = {u["id"]: u for u in data.get("includes", {}).get("users", [])}
+            tweets = data.get("data", [])
+            # En eskiden en yeniye sırala ki Telegram bildirimleri doğru sırada gitsin
+            tweets = sorted(tweets, key=lambda t: t["id"])
+            for t in tweets:
+                author = users.get(t["author_id"], {})
+                followers = author.get("public_metrics", {}).get("followers_count", 0)
                 if followers < MIN_FOLLOWERS:
                     continue
-
                 username = author.get("username", "user")
-                tid = tweet.get("id")
+                tid = t["id"]
                 link = f"https://twitter.com/{username}/status/{tid}"
-
                 msg = (
                     "🚨 Yeni tweet yakalandı\n"
                     f"👤 @{username} ({followers} takipçi)\n"
@@ -121,25 +92,21 @@ def stream():
                 )
                 tg_send(msg)
                 print("Sent:", link)
-            except Exception as e:
-                print("Parse error:", e)
+                since_id = tid  # en yeni id'yi ilerlet
+        except Exception as e:
+            print("Poll error:", e)
+
+        time.sleep(7)  # 5–10 sn arası idealdir (limitine göre ayarla)
+
+def require_env():
+    missing = [k for k, v in {
+        "TW_BEARER": TW_BEARER,
+        "TG_BOT_TOKEN": TG_BOT_TOKEN,
+        "TG_CHAT_ID": TG_CHAT_ID
+    }.items() if not v]
+    if missing:
+        raise SystemExit(f"Missing env vars: {', '.join(missing)}")
 
 if __name__ == "__main__":
     require_env()
-    try:
-        set_rules()
-    except requests.exceptions.InvalidHeader as e:
-        print("⚠️ Bearer Token formatı hatalı (çok satır olabilir). Env'de TW_BEARER tek satır olsun.")
-        raise
-    except Exception as e:
-        print("Rules set error:", e)
-        raise
-
-    backoff = 1
-    while True:
-        try:
-            stream()
-        except Exception as e:
-            print("Stream error, reconnecting...", e)
-            time.sleep(min(backoff, 60))
-            backoff = min(backoff * 2, 60)
+    run_polling()
